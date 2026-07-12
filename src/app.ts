@@ -5,7 +5,9 @@ import { Pool } from 'pg';
 import { drizzle, NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { eq } from 'drizzle-orm';
 import { parse } from 'url';
+import { randomUUID } from 'crypto';
 import Redis from 'ioredis';
+import { Kafka, Producer } from 'kafkajs';
 import { users, messages } from './schema';
 import { hashPassword, verifyPassword, generateToken, verifyToken } from './auth';
 import {
@@ -14,13 +16,36 @@ import {
   createRedisClient,
   channelForRoom,
 } from './redis-glue';
+import { CHAT_TOPIC } from './kafka-consumer';
 
-let pool: Pool | undefined;
-let wss: WebSocketServer | undefined;
-let publisher: Redis | undefined;
+// Each createApp() call is a fully self-contained instance. No shared module
+// state, so multiple instances can run side-by-side in one process.
+interface AppInstance {
+  pool: Pool;
+  wss: WebSocketServer;
+  publisher: Redis;
+  subscriber: Redis;
+  producer?: Producer;
+}
+const instances = new Set<AppInstance>();
+
+async function teardown(inst: AppInstance): Promise<void> {
+  if (!instances.has(inst)) return;
+  instances.delete(inst);
+  inst.wss.close();
+  await inst.publisher.quit().catch(() => {});
+  await inst.subscriber.quit().catch(() => {});
+  if (inst.producer) {
+    await inst.producer.disconnect().catch(() => {});
+  }
+  await inst.pool.end().catch(() => {});
+}
 
 export async function createApp(): Promise<{ app: Express; server: Server }> {
-  pool = new Pool({ connectionString: process.env.DATABASE_URL });
+  const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+  // Idle clients can error (e.g. server shutdown terminating the connection);
+  // without a listener pg re-throws it as an uncaught exception.
+  pool.on('error', () => {});
   const db: NodePgDatabase = drizzle(pool);
 
   // Sync the Drizzle-defined users table to the DB.
@@ -42,8 +67,15 @@ export async function createApp(): Promise<{ app: Express; server: Server }> {
     );
   `);
 
+  // Unique per app instance so a load balancer's fan-out is observable.
+  const serverId = randomUUID();
+
   const app = express();
   app.use(express.json());
+
+  app.get('/health', (_req: Request, res: Response) => {
+    return res.status(200).json({ status: 'ok', serverId });
+  });
 
   app.post('/signup', async (req: Request, res: Response) => {
     const { username, password } = req.body ?? {};
@@ -95,20 +127,42 @@ export async function createApp(): Promise<{ app: Express; server: Server }> {
   const server = createServer(app);
 
   // Shared publisher; a subscribed connection cannot also publish.
-  publisher = createRedisClient();
+  const publisher = createRedisClient();
+
+  // Kafka write buffer. When configured, chat writes go through Kafka instead
+  // of a direct DB insert; a background consumer batch-writes them to Postgres.
+  let producer: Producer | undefined;
+  const kafkaBrokers = (process.env.KAFKA_BROKERS ?? '').split(',').filter(Boolean);
+  if (kafkaBrokers.length > 0) {
+    const kafka = new Kafka({ clientId: 'chat-producer', brokers: kafkaBrokers });
+    producer = kafka.producer();
+    await producer.connect();
+  }
+
+  // One subscriber per instance (connected once, up front), plus a local map of
+  // room channel -> connected sockets on THIS instance. Redis fans out across
+  // instances; this map fans out to the local sockets. Keeping the subscriber
+  // pre-connected means SUBSCRIBE on join is a single fast round-trip instead of
+  // paying connection setup inside the join critical path.
+  const subscriber = createRedisClient();
+  const roomClients = new Map<string, Set<WebSocket>>();
+
+  subscriber.on('message', (channel, payload) => {
+    const clients = roomClients.get(channel);
+    if (!clients) return;
+    for (const client of clients) {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(payload);
+      }
+    }
+  });
 
   // WS server with manual upgrade so we can reject unauthenticated clients.
-  wss = new WebSocketServer({ noServer: true });
+  const wss = new WebSocketServer({ noServer: true });
 
   wss.on('connection', (ws: WebSocket) => {
     const user = (ws as any).user as { userId: number; username: string };
-    const subscriber = createRedisClient();
-
-    subscriber.on('message', (_channel, payload) => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(payload);
-      }
-    });
+    const joinedChannels = new Set<string>();
 
     ws.on('message', async (data) => {
       let msg: any;
@@ -119,17 +173,35 @@ export async function createApp(): Promise<{ app: Express; server: Server }> {
       }
 
       if (msg.type === 'join') {
-        await subscriber.subscribe(channelForRoom(msg.roomId));
+        const channel = channelForRoom(msg.roomId);
+        let clients = roomClients.get(channel);
+        if (!clients) {
+          clients = new Set();
+          roomClients.set(channel, clients);
+          // Only hit Redis the first time this instance cares about the room.
+          await subscriber.subscribe(channel);
+        }
+        clients.add(ws);
+        joinedChannels.add(channel);
         return;
       }
 
       if (msg.type === 'chat') {
-        // Naive synchronous write: insert straight into Postgres.
-        await db.insert(messages).values({
+        const record = {
           roomId: msg.roomId,
           content: msg.text,
           senderId: user.userId,
-        });
+        };
+        if (producer) {
+          // Buffer the write through Kafka (consumer batch-inserts later).
+          await producer.send({
+            topic: CHAT_TOPIC,
+            messages: [{ value: JSON.stringify(record) }],
+          });
+        } else {
+          // No Kafka configured: fall back to a direct synchronous insert.
+          await db.insert(messages).values(record);
+        }
         // Fan out to the room's subscribers via Redis pub/sub.
         const payload = serializeMessage({
           type: 'chat',
@@ -137,13 +209,20 @@ export async function createApp(): Promise<{ app: Express; server: Server }> {
           sender: user.username,
           text: msg.text,
         });
-        await publisher!.publish(channelForRoom(msg.roomId), payload);
+        await publisher.publish(channelForRoom(msg.roomId), payload);
         return;
       }
     });
 
     ws.on('close', () => {
-      subscriber.quit();
+      for (const channel of joinedChannels) {
+        const clients = roomClients.get(channel);
+        clients?.delete(ws);
+        if (clients && clients.size === 0) {
+          roomClients.delete(channel);
+          void subscriber.unsubscribe(channel);
+        }
+      }
     });
   });
 
@@ -165,26 +244,25 @@ export async function createApp(): Promise<{ app: Express; server: Server }> {
       return reject();
     }
 
-    wss!.handleUpgrade(req, socket, head, (ws: WebSocket) => {
+    wss.handleUpgrade(req, socket, head, (ws: WebSocket) => {
       (ws as any).user = payload;
-      wss!.emit('connection', ws, req);
+      wss.emit('connection', ws, req);
     });
+  });
+
+  const instance: AppInstance = { pool, wss, publisher, subscriber, producer };
+  instances.add(instance);
+  // Closing the server tears down this instance's DB/Redis connections, so a
+  // test that only calls server.close() still cleans up.
+  server.on('close', () => {
+    void teardown(instance);
   });
 
   return { app, server };
 }
 
 export async function closeApp(): Promise<void> {
-  if (wss) {
-    wss.close();
-    wss = undefined;
-  }
-  if (publisher) {
-    await publisher.quit();
-    publisher = undefined;
-  }
-  if (pool) {
-    await pool.end();
-    pool = undefined;
+  for (const inst of [...instances]) {
+    await teardown(inst);
   }
 }

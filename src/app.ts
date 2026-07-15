@@ -17,6 +17,9 @@ import {
   channelForRoom,
 } from './redis-glue';
 import { CHAT_TOPIC } from './kafka-consumer';
+import { GameStateManager } from './game/state-machine';
+import { GameOrchestrator } from './game/orchestrator';
+import { mockBotResponder } from './game/mock-responder';
 
 // Each createApp() call is a fully self-contained instance. No shared module
 // state, so multiple instances can run side-by-side in one process.
@@ -26,6 +29,8 @@ interface AppInstance {
   publisher: Redis;
   subscriber: Redis;
   producer?: Producer;
+  orchestrator: GameOrchestrator;
+  stateManager: GameStateManager;
 }
 const instances = new Set<AppInstance>();
 
@@ -33,6 +38,8 @@ async function teardown(inst: AppInstance): Promise<void> {
   if (!instances.has(inst)) return;
   instances.delete(inst);
   inst.wss.close();
+  inst.orchestrator.dispose();
+  await inst.stateManager.close().catch(() => {});
   await inst.publisher.quit().catch(() => {});
   await inst.subscriber.quit().catch(() => {});
   if (inst.producer) {
@@ -157,6 +164,25 @@ export async function createApp(): Promise<{ app: Express; server: Server }> {
     }
   });
 
+  // Game control plane. Phase durations are env-tunable (integration tests shrink
+  // them). The mock responder stands in for the LLM until Phase 13; swapping it
+  // for the Ollama-backed generateBotResponse is a one-line change here.
+  const stateManager = new GameStateManager(process.env.REDIS_URL!);
+  const orchestrator = new GameOrchestrator({
+    stateStore: stateManager,
+    generateResponse: mockBotResponder,
+    broadcast: (roomId, payload) => {
+      // .catch swallows the race where a publish is issued as the instance is
+      // being torn down (publisher already quit -> "Connection is closed").
+      publisher
+        .publish(channelForRoom(roomId), serializeMessage(payload))
+        .catch(() => {});
+    },
+    chatDurationMs: Number(process.env.CHAT_DURATION_MS ?? 180_000),
+    voteDurationMs: Number(process.env.VOTE_DURATION_MS ?? 60_000),
+    botCadenceMs: Number(process.env.BOT_CADENCE_MS ?? 15_000),
+  });
+
   // WS server with manual upgrade so we can reject unauthenticated clients.
   const wss = new WebSocketServer({ noServer: true });
 
@@ -183,6 +209,11 @@ export async function createApp(): Promise<{ app: Express; server: Server }> {
         }
         clients.add(ws);
         joinedChannels.add(channel);
+        // Add to the game roster (deduped) so start/voting see this player.
+        orchestrator.addPlayer(msg.roomId, {
+          id: user.userId,
+          username: user.username,
+        });
         return;
       }
 
@@ -202,14 +233,42 @@ export async function createApp(): Promise<{ app: Express; server: Server }> {
           // No Kafka configured: fall back to a direct synchronous insert.
           await db.insert(messages).values(record);
         }
-        // Fan out to the room's subscribers via Redis pub/sub.
+        // Feed the bot's context window, then fan out via Redis pub/sub.
+        orchestrator.recordMessage(msg.roomId, user.username, msg.text);
         const payload = serializeMessage({
           type: 'chat',
           roomId: msg.roomId,
+          id: randomUUID(),
+          senderId: String(user.userId),
           sender: user.username,
           text: msg.text,
         });
         await publisher.publish(channelForRoom(msg.roomId), payload);
+        return;
+      }
+
+      if (msg.type === 'start') {
+        // Any room member may start; this instance then owns the game's timers.
+        await orchestrator.startGame(msg.roomId);
+        return;
+      }
+
+      if (msg.type === 'vote') {
+        try {
+          await orchestrator.castVote(msg.roomId, {
+            voterId: user.userId,
+            targetId: Number(msg.targetId),
+          });
+        } catch (err) {
+          // Rejected votes (wrong phase / already voted) go only to this socket.
+          ws.send(
+            serializeMessage({
+              type: 'error',
+              code: 'vote_rejected',
+              message: err instanceof Error ? err.message : 'vote rejected',
+            })
+          );
+        }
         return;
       }
     });
@@ -250,7 +309,15 @@ export async function createApp(): Promise<{ app: Express; server: Server }> {
     });
   });
 
-  const instance: AppInstance = { pool, wss, publisher, subscriber, producer };
+  const instance: AppInstance = {
+    pool,
+    wss,
+    publisher,
+    subscriber,
+    producer,
+    orchestrator,
+    stateManager,
+  };
   instances.add(instance);
   // Closing the server tears down this instance's DB/Redis connections, so a
   // test that only calls server.close() still cleans up.

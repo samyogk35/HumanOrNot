@@ -80,4 +80,16 @@ export class BotManager {
       this.cadences.delete(roomId);
     }
   }
+
+  /**
+   * Remove the room's bot (if any) and stop its cadence. Used on play-again so a
+   * fresh game can inject a new bot without tripping the one-bot invariant. Human
+   * players are left in place.
+   */
+  removeBot(roomId: string): void {
+    this.stopBotCadence(roomId);
+    const list = this.roomPlayers(roomId);
+    const idx = list.findIndex((p) => p.isBot);
+    if (idx !== -1) list.splice(idx, 1);
+  }
 }

@@ -3,4 +3,11 @@ node_modules
 dist
 coverage
 .stryker-tmp
+
+# macOS / external-drive junk (AppleDouble resource forks, Finder metadata)
+.DS_Store
+._*
+
+# planning docs (remove these two lines to track them on GitHub)
 PLAN.md
+SPEC.md

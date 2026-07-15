@@ -1,13 +1,13 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import request from 'supertest';
 import WebSocket from 'ws';
-import { PostgreSqlContainer, GenericContainer, StartedTestContainer } from 'testcontainers';
+import { PostgreSqlContainer, StartedPostgreSqlContainer, GenericContainer, StartedTestContainer } from 'testcontainers';
 import { createApp, closeApp } from '../src/app';
 import { writeFileSync, unlinkSync } from 'fs';
 import { join } from 'path';
 
 describe('Nginx Load Balancer', () => {
-  let pgContainer: StartedTestContainer;
+  let pgContainer: StartedPostgreSqlContainer;
   let redisContainer: StartedTestContainer;
   let nginxContainer: StartedTestContainer;
   

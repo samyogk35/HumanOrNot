@@ -54,4 +54,9 @@ export class VotingManager {
       tally: this.tallyVotes(roomId),
     };
   }
+
+  /** Drop all votes for a room so a new game starts with a clean slate. */
+  clearVotes(roomId: string): void {
+    this.votes.delete(roomId);
+  }
 }

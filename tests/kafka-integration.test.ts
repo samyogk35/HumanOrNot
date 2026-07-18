@@ -22,7 +22,11 @@ describe('Kafka Write Path Integration', () => {
     // 1. Boot Infra (DB, Redis, Kafka)
     pgContainer = await new PostgreSqlContainer('postgres:16-alpine').start();
     redisContainer = await new GenericContainer('redis:7-alpine').withExposedPorts(6379).start();
-    kafkaContainer = await new KafkaContainer().start();
+    // Pin the image + give Kafka a generous startup budget; the default unpinned
+    // image intermittently exits before it's ready on shared CI runners.
+    kafkaContainer = await new KafkaContainer('confluentinc/cp-kafka:7.5.0')
+      .withStartupTimeout(120_000)
+      .start();
     
     const dbUrl = pgContainer.getConnectionUri();
     process.env.DATABASE_URL = dbUrl;
@@ -58,13 +62,15 @@ describe('Kafka Write Path Integration', () => {
   }, 90000); // Kafka container takes a bit longer to boot
 
   afterAll(async () => {
-    await stopKafkaConsumer();
-    await closeApp();
-    await pgClient.end();
-    
-    await kafkaContainer.stop();
-    await redisContainer.stop();
-    await pgContainer.stop();
+    // Guard every step: if beforeAll bailed partway (e.g. Kafka container died),
+    // the unset handles must not throw and mask the real setup failure.
+    await stopKafkaConsumer().catch(() => {});
+    await closeApp().catch(() => {});
+    await pgClient?.end().catch(() => {});
+
+    await kafkaContainer?.stop().catch(() => {});
+    await redisContainer?.stop().catch(() => {});
+    await pgContainer?.stop().catch(() => {});
   });
 
   it('should buffer messages through Kafka before batch writing to Postgres', async () => {
